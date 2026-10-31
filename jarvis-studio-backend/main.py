@@ -7,7 +7,9 @@ import datetime as _dt
 import os
 import re
 import sys
+import threading
 import time
+import uuid
 
 # LLM responses contain Unicode the Windows console can't encode by default
 # (em-dashes, non-breaking hyphens "‑", emoji), which makes print() raise
@@ -131,6 +133,7 @@ def _setup_snapshot_for_replay():
 from wake_word.base import WakeWordDetector
 from transcription.whisper_transcriber import (
     transcribe, transcribe_clip, transcribe_voice_note, preload as preload_whisper,
+    record_manual_audio, transcribe_recording,
 )
 from wake_word.capture import command_after_wake, is_noise as is_noise_transcript
 from tts.tts_engine import TTSEngine
@@ -141,8 +144,17 @@ import weather as weather_mod
 _WAKE_PHRASES = ("wake up", "wake", "jarvis wake", "are you there", "you awake")
 
 _tts: "TTSEngine | None" = None
-_trigger_listen: "asyncio.Event | None" = None
 _pipeline_lock: "asyncio.Lock | None" = None
+_recording_lock: "asyncio.Lock | None" = None
+_recording_state = "idle"
+_recording_server_id = uuid.uuid4().hex
+_recording_generation = 0
+_recording_revision = 0
+_recording_stop: "threading.Event | None" = None
+_recording_cancel: "threading.Event | None" = None
+_recording_task: "asyncio.Task | None" = None
+_recording_owner_client_id = ""
+_recording_terminal_request_id: "str | None" = None
 # The WhatsApp channel (whatsapp_channel.py), once enabled, and the chat a running
 # WhatsApp turn answers (None during any other turn).
 _wa: "whatsapp_channel.Channel | None" = None
@@ -152,6 +164,35 @@ _always_on_event: "asyncio.Event | None" = None
 # Set by the Stop button: aborts the in-flight reply (stops generation, drops any
 # queued speech, and forces the HUD back to idle so the next request can go).
 _interrupt: "asyncio.Event | None" = None
+
+
+def _new_recording_event(state: str, request_id=None, action=None) -> dict:
+    """Create a versioned lifecycle event after its state transition."""
+    global _recording_revision
+    _recording_revision += 1
+    return {
+        "server_id": _recording_server_id,
+        "generation": _recording_generation,
+        "revision": _recording_revision,
+        "state": state,
+        "request_id": request_id,
+        "action": action,
+    }
+
+
+def _recording_state_snapshot() -> dict:
+    """Return the current lifecycle version for a newly connected window."""
+    state = _recording_state
+    if state in {"stopping", "cancelling"}:
+        state = "transcribing" if state == "stopping" else "cancelling"
+    return {
+        "server_id": _recording_server_id,
+        "generation": _recording_generation,
+        "revision": _recording_revision,
+        "state": state,
+        "request_id": None,
+        "action": None,
+    }
 
 
 def _interrupted() -> bool:
@@ -1118,8 +1159,25 @@ async def handle_remote_input(data) -> None:
 
 
 async def handle_remote_disconnect(_client) -> None:
-    """A phone's socket dropped — tear down any screen/control lease it owned so a
-    stale session can't linger (and the mouse button is never left held)."""
+    """Cancel a recording only when its owning websocket disconnects."""
+    global _recording_state
+    client_id = current_client_id()
+    lifecycle_event = None
+    async with _recording_lock:
+        if client_id and client_id == _recording_owner_client_id:
+            if _recording_state != "idle":
+                was_transcribing = _recording_state == "transcribing"
+                if _recording_cancel is not None:
+                    _recording_cancel.set()
+                if _recording_stop is not None:
+                    _recording_stop.set()
+                _recording_state = "cancelling"
+                lifecycle_event = _new_recording_event("cancelling")
+                if (was_transcribing and _recording_task is not None
+                        and not _recording_task.done()):
+                    _recording_task.cancel()
+    if lifecycle_event is not None:
+        await emit("recording_state", lifecycle_event)
     if not is_current_sender_remote() or _remote_screen_lock is None:
         return
     client_id = current_client_id()
@@ -3459,29 +3517,151 @@ async def handle_text_input(data) -> None:
                 "text pipeline")
 
 
-async def handle_trigger_listen(data) -> None:
-    # Push-to-talk: when the trigger carries ptt=true (Ctrl+Space *held*), record
-    # until the key is released (finish_listen) instead of stopping on silence.
+async def _manual_recording_worker(generation: int, stop_event: threading.Event,
+                                   cancel_event: threading.Event) -> None:
+    global _recording_state, _recording_stop, _recording_cancel
+    global _recording_task, _recording_generation, _recording_owner_client_id
+    global _recording_terminal_request_id, _user_busy
     try:
-        from transcription import whisper_transcriber as _wt
-        _wt.set_ptt(bool((data or {}).get("ptt")))
-    except Exception:  # noqa: BLE001
-        pass
-    if _trigger_listen is not None:
-        _trigger_listen.set()
+        audio = await asyncio.to_thread(record_manual_audio, stop_event, cancel_event)
+        if cancel_event.is_set():
+            return
+
+        transcribing_event = None
+        async with _recording_lock:
+            if (generation != _recording_generation
+                    or _recording_state not in {"recording", "stopping"}
+                    or cancel_event.is_set()):
+                return
+            if _recording_state == "recording":
+                transcribing_event = _new_recording_event("transcribing")
+            _recording_state = "transcribing"
+        if transcribing_event is not None:
+            await emit("recording_state", transcribing_event)
+
+        text = await transcribe_recording(audio)
+        if cancel_event.is_set():
+            return
+        if not text:
+            await emit("response", "I couldn't make out any speech in that recording.")
+            return
+        await _run_pipeline(text, emit_transcription=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Voice] Manual recording failed: {exc}", flush=True)
+        await emit("response", "I couldn't complete that recording. Please try again.")
+    finally:
+        idle_event = None
+        async with _recording_lock:
+            if generation == _recording_generation:
+                _recording_state = "idle"
+                _recording_stop = None
+                _recording_cancel = None
+                _recording_task = None
+                _recording_owner_client_id = ""
+                idle_event = _new_recording_event(
+                    "idle", _recording_terminal_request_id,
+                    "cancel" if _recording_terminal_request_id else None,
+                )
+                _recording_terminal_request_id = None
+                _user_busy = False
+        if idle_event is not None:
+            await emit("recording_state", idle_event)
 
 
-async def handle_finish_listen(_data) -> None:
-    """End the current listening turn NOW and transcribe what was captured.
+async def handle_start_recording(data=None) -> None:
+    """Start one explicit, bounded microphone recording session."""
+    global _recording_state, _recording_generation, _recording_stop
+    global _recording_cancel, _recording_task, _recording_owner_client_id
+    global _recording_terminal_request_id, _user_busy
+    request_id = data.get("request_id") if isinstance(data, dict) else None
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+        request_id = None
+    rejection = None
+    lifecycle_event = None
+    async with _recording_lock:
+        if _recording_state != "idle":
+            rejection = "A recording session is already active."
+        elif _pipeline_lock is not None and _pipeline_lock.locked():
+            rejection = "Wait for the current response to finish before recording."
+        else:
+            _recording_generation += 1
+            generation = _recording_generation
+            stop_event = threading.Event()
+            cancel_event = threading.Event()
+            _recording_stop = stop_event
+            _recording_cancel = cancel_event
+            _recording_owner_client_id = current_client_id()
+            _recording_terminal_request_id = None
+            _recording_state = "recording"
+            _user_busy = True
+            lifecycle_event = _new_recording_event(
+                "recording", request_id, "start")
+            _recording_task = asyncio.create_task(
+                _manual_recording_worker(generation, stop_event, cancel_event))
+    if lifecycle_event is not None:
+        await emit("recording_state", lifecycle_event)
+    if rejection:
+        if request_id:
+            await send_to_current("recording_rejected", {
+                "request_id": request_id, "action": "start",
+                "message": rejection,
+            })
+        else:
+            await emit("warning", rejection)
 
-    Fired by the overlay ✓ button and by releasing the push-to-talk key. Unlike
-    stop_speech (which cancels/drops the turn), this commits the audio so far.
-    """
-    try:
-        from transcription import whisper_transcriber as _wt
-        _wt.request_finish()
-    except Exception:  # noqa: BLE001
-        pass
+
+async def handle_stop_recording(data=None) -> None:
+    """Stop the active recording and submit its captured audio for transcription."""
+    global _recording_state
+    request_id = data.get("request_id") if isinstance(data, dict) else None
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+        request_id = None
+    lifecycle_event = None
+    async with _recording_lock:
+        if _recording_state != "recording" or _recording_stop is None:
+            rejection = "There is no active recording to stop."
+        else:
+            rejection = None
+            _recording_state = "stopping"
+            _recording_stop.set()
+            lifecycle_event = _new_recording_event(
+                "transcribing", request_id, "stop")
+    if lifecycle_event is not None:
+        await emit("recording_state", lifecycle_event)
+    elif request_id:
+        await send_to_current("recording_rejected", {
+            "request_id": request_id, "action": "stop",
+            "message": rejection,
+        })
+
+
+async def handle_cancel_recording(data=None) -> bool:
+    """Cancel the active capture and discard its in-memory audio."""
+    global _recording_state, _recording_terminal_request_id
+    request_id = data.get("request_id") if isinstance(data, dict) else None
+    if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+        request_id = None
+    lifecycle_event = None
+    async with _recording_lock:
+        if (_recording_state not in {"recording", "stopping", "cancelling"}
+                or _recording_stop is None or _recording_cancel is None):
+            rejected = True
+        else:
+            rejected = False
+            _recording_state = "cancelling"
+            _recording_terminal_request_id = request_id
+            _recording_cancel.set()
+            _recording_stop.set()
+            lifecycle_event = _new_recording_event(
+                "cancelling", request_id, "cancel")
+    if lifecycle_event is not None:
+        await emit("recording_state", lifecycle_event)
+    elif rejected and request_id:
+        await send_to_current("recording_rejected", {
+            "request_id": request_id, "action": "cancel",
+            "message": "There is no active recording to cancel.",
+        })
+    return lifecycle_event is not None
 
 
 async def handle_stop_speech(_data) -> None:
@@ -3493,13 +3673,7 @@ async def handle_stop_speech(_data) -> None:
     their next request right away."""
     if _interrupt is not None:
         _interrupt.set()
-    # Cut off the microphone if we're mid-listen (the overlay "stop" button works
-    # while JARVIS is listening, not just while it's speaking).
-    try:
-        from transcription.whisper_transcriber import request_cancel
-        request_cancel()
-    except Exception:       # noqa: BLE001 — best-effort
-        pass
+    recording_cancelled = await handle_cancel_recording()
     if _tts:
         _tts.stop()
     # A hard stop is also a panic stop: immediately revoke any armed mouse/keyboard
@@ -3509,7 +3683,8 @@ async def handle_stop_speech(_data) -> None:
         computer.disarm()
     except Exception:       # noqa: BLE001
         pass
-    await emit("status", "idle")
+    if not recording_cancelled:
+        await emit("status", "idle")
 
 
 async def handle_stop_control(_data) -> None:
@@ -4275,6 +4450,12 @@ async def push_sysinfo(client=None) -> None:
         await push("setup_progress", _snap)
     await push("mute", skills.is_mute_toggled())
     await push("recordings", recorder.active_recordings())
+    if _recording_lock is None:
+        recording_snapshot = _recording_state_snapshot()
+    else:
+        async with _recording_lock:
+            recording_snapshot = _recording_state_snapshot()
+    await push("recording_state", recording_snapshot)
     await push("browser_state", browser.state())
     await push("control_state", computer.state())
     await push("screen", get_screen())
@@ -4718,23 +4899,12 @@ async def wake_word_loop(detector: WakeWordDetector) -> None:
             if always_on:
                 await loop.run_in_executor(None, detector_stop)   # we drive the mic ourselves
                 detection_event.clear()
-                _trigger_listen.clear()
                 await emit("status", "listening")
             else:
                 detector_start()                 # ensure it's live (no double-open)
-                wake_task = asyncio.create_task(detection_event.wait())
-                trig_task = asyncio.create_task(_trigger_listen.wait())
-                done, pending = await asyncio.wait(
-                    {wake_task, trig_task},
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for t in pending:
-                    t.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await t
-                woke = wake_task in done
+                await detection_event.wait()
+                woke = True
                 detection_event.clear()
-                _trigger_listen.clear()
                 # ── Pop the overlay up the INSTANT we detect — BEFORE the mic
                 #    handoff. The detector's PyAudio teardown can take a few hundred
                 #    ms, so doing it first (and on the event loop) was what made the
@@ -4802,11 +4972,25 @@ async def wake_word_loop(detector: WakeWordDetector) -> None:
 
 
 async def main(use_text: bool) -> None:
-    global _tts, _trigger_listen, _pipeline_lock, _interrupt, _main_loop, _always_on_event
+    global _tts, _pipeline_lock, _recording_lock
+    global _recording_state, _recording_server_id, _recording_generation
+    global _recording_revision, _recording_task, _recording_stop, _recording_cancel
+    global _recording_owner_client_id
+    global _recording_terminal_request_id
+    global _interrupt, _main_loop, _always_on_event
     global _manual_coords, _remote_screen_lock, _remote_input_lock, _remote_emit_lock
 
-    _trigger_listen = asyncio.Event()
     _pipeline_lock = asyncio.Lock()
+    _recording_lock = asyncio.Lock()
+    _recording_state = "idle"
+    _recording_server_id = uuid.uuid4().hex
+    _recording_generation = 0
+    _recording_revision = 0
+    _recording_task = None
+    _recording_stop = None
+    _recording_cancel = None
+    _recording_owner_client_id = ""
+    _recording_terminal_request_id = None
     _interrupt = asyncio.Event()
     # Serialize live remote-desktop signalling and input on this loop.
     _remote_screen_lock = asyncio.Lock()
@@ -4834,8 +5018,9 @@ async def main(use_text: bool) -> None:
         pass
 
     register_handler("text_input", handle_text_input)
-    register_handler("trigger_listen", handle_trigger_listen)
-    register_handler("finish_listen", handle_finish_listen)
+    register_handler("start_recording", handle_start_recording)
+    register_handler("stop_recording", handle_stop_recording)
+    register_handler("cancel_recording", handle_cancel_recording)
     register_handler("stop_speech", handle_stop_speech)
     register_handler("stop_control", handle_stop_control)
     register_handler("pause_control", handle_pause_control)
@@ -4947,7 +5132,6 @@ async def main(use_text: bool) -> None:
                              lambda: any(not d["pending"] for d in (
                                  _device_registry.list_devices(include_revoked=False)
                                  if _device_registry else ())))
-        on_disconnect(handle_remote_disconnect)
         # Bind all interfaces so a Tailscale peer can reach us; the crypto+whois
         # transport gate is the real access control (plan G3/S3). Respect an
         # explicit launcher override if one was set.
@@ -4956,6 +5140,7 @@ async def main(use_text: bool) -> None:
     except Exception as exc:  # noqa: BLE001
         _device_registry = None
         print(f"[Remote] Disabled (identity init failed: {exc}); local-only.", flush=True)
+    on_disconnect(handle_remote_disconnect)
     on_connect(push_sysinfo)
     # Make stored coords available to the places/weather actions immediately.
     if _user_coords:
@@ -5012,8 +5197,8 @@ async def main(use_text: bool) -> None:
     # The installer ships lean, so the heavy runtime assets (Chromium, the Whisper
     # base model, the Piper voice) download ONCE here, on first launch, with progress
     # shown on the HUD (setup_progress events). Instant and silent on every later run
-    # (all present). Awaited so the warm-ups below load from a complete cache and the
-    # wake-word loop doesn't start mid-download. Best-effort — never blocks on error.
+    # (all present). Awaited so the warm-ups below load from a complete cache. This
+    # setup does not open the microphone; voice capture starts only on a user action.
     global _setup_in_progress
     try:
         if provisioning is not None:
@@ -5026,9 +5211,9 @@ async def main(use_text: bool) -> None:
 
     # Warm the local Whisper model + Piper voice in the BACKGROUND (load the ONNX
     # models into RAM; the DOWNLOADS are already done by provisioning above). Not
-    # awaited, so the app is responsive immediately and the wake-word loop starts at
-    # once: Whisper is the offline STT fallback (~40s cold load) and Piper is the
-    # daily-driver voice (~7s load) whose load would otherwise stall the first reply.
+    # awaited, so the app is responsive immediately: Whisper is the offline STT
+    # fallback (~40s cold load) and Piper is the daily-driver voice (~7s load) whose
+    # load would otherwise stall the first reply.
     _track_task(preload_whisper(), "whisper preload")
     _track_task(_tts.preload(), "tts preload")
 
@@ -5036,12 +5221,19 @@ async def main(use_text: bool) -> None:
         if use_text:
             await text_loop()
         else:
-            from wake_word import create_detector
-            detector = create_detector()
-            await wake_word_loop(detector)
+            await emit("status", "idle")
+            print("[Jarvis] Ready. Use the microphone control to start recording.\n",
+                  flush=True)
+            await asyncio.Event().wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
         print("\n[Jarvis] Shutting down.")
     finally:
+        if _recording_cancel is not None:
+            _recording_cancel.set()
+        if _recording_stop is not None:
+            _recording_stop.set()
+        if _recording_task is not None:
+            await asyncio.gather(_recording_task, return_exceptions=True)
         with contextlib.suppress(Exception):
             await mcp_client.stop_all()
         for t in hud_tasks:

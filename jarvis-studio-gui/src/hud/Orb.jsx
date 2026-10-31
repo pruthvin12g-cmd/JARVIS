@@ -3,9 +3,9 @@
    idle, ripples while listening, an orbiting arc while thinking or working, a pulse
    while speaking). Pure CSS animation (home.css), so it costs no JS per frame. */
 
-export default function Orb({ status = "idle", label, onClick }) {
+export default function Orb({ status = "idle", label, onClick, disabled = false }) {
   return (
-    <button type="button" className={`orb orb--${status}`} onClick={onClick}
+    <button type="button" className={`orb orb--${status}`} onClick={onClick} disabled={disabled}
             aria-label={label} title={label}>
       <span className="orb-halo" aria-hidden />
       <span className="orb-ripple" aria-hidden />

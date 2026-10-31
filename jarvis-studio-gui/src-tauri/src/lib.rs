@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, Manager, State,
+    Manager, State,
 };
 
 struct BackendState {
@@ -234,37 +234,6 @@ pub fn run() {
                 child: Mutex::new(child),
                 quitting: AtomicBool::new(false),
             });
-
-            #[cfg(desktop)]
-            {
-                use tauri_plugin_global_shortcut::{
-                    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
-                };
-                let listen_shortcut = Shortcut::new(Some(Modifiers::CONTROL), Code::Space);
-                let shortcut_plugin = app.handle().plugin(
-                    tauri_plugin_global_shortcut::Builder::new()
-                        .with_handler(move |app, shortcut, event| {
-                            if shortcut == &listen_shortcut {
-                                // Push-to-talk: hold to listen, release to send.
-                                match event.state() {
-                                    ShortcutState::Pressed => {
-                                        let _ = app.emit("ptt-start", ());
-                                    }
-                                    ShortcutState::Released => {
-                                        let _ = app.emit("ptt-stop", ());
-                                    }
-                                }
-                            }
-                        })
-                        .build(),
-                );
-
-                if let Err(error) = shortcut_plugin {
-                    eprintln!("warning: global shortcut plugin failed to initialize: {error}");
-                } else if let Err(error) = app.global_shortcut().register(listen_shortcut) {
-                    eprintln!("warning: Ctrl+Space global shortcut is unavailable: {error}");
-                }
-            }
 
             let quit =
                 MenuItem::with_id(app, "quit", "Quit JARVIS", true, None::<&str>)?;

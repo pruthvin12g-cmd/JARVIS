@@ -40,6 +40,14 @@
   cursor: default;
 }
 
+.pill.is-busy.pill--recording {
+  cursor: pointer;
+}
+
+.pill--transcribing {
+  cursor: wait;
+}
+
 .pill-face {
   position: relative;
   width: 100%;
@@ -270,6 +278,10 @@
   animation-duration: 1040ms;
 }
 
+.pill--transcribing .pill-bar {
+  animation-duration: 1040ms;
+}
+
 .pill--speaking .pill-bar {
   animation-duration: 520ms;
 }
@@ -326,6 +338,11 @@
 
 button.pill-action {
   cursor: pointer;
+}
+
+.pill-action:disabled {
+  opacity: 0.45;
+  cursor: wait;
 }
 
 .pill-action--cancel {

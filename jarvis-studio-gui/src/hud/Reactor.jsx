@@ -9,6 +9,8 @@ const SIZE = 522;
 const MOODS = {
   idle:      { speed: 0.40, energy: 0.34 },
   listening: { speed: 1.30, energy: 0.95 },
+  recording: { speed: 1.30, energy: 0.95 },
+  transcribing: { speed: 0.95, energy: 0.75 },
   thinking:  { speed: 0.95, energy: 0.75 },
   working:   { speed: 0.80, energy: 0.65 },
   speaking:  { speed: 1.70, energy: 1.00 },
@@ -108,9 +110,11 @@ export function Waveform({ status = "idle", bars = 36 }) {
   );
 }
 
-export default function Reactor({ status = "idle", label, onClick, rgb = [0, 229, 255] }) {
+export default function Reactor({
+  status = "idle", label, onClick, disabled = false, rgb = [0, 229, 255],
+}) {
   return (
-    <button type="button" className={`reactor reactor--${status}`} onClick={onClick}
+    <button type="button" className={`reactor reactor--${status}`} onClick={onClick} disabled={disabled}
             aria-label={label} title={label}>
       <span className="reactor-glow" aria-hidden />
       <Rings status={status} rgb={rgb} layer="back" />

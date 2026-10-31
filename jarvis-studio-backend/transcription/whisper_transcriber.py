@@ -254,6 +254,47 @@ def _record_until_silence() -> np.ndarray:
     return np.concatenate(frames).astype(np.int16)
 
 
+def record_manual_audio(stop_event: threading.Event,
+                        cancel_event: threading.Event) -> np.ndarray:
+    """Capture a manual recording until stopped or the duration cap is reached.
+
+    Audio stays in RAM. Cancellation always discards the captured frames.
+    """
+    pa = pyaudio.PyAudio()
+    stream = None
+    frames: list[np.ndarray] = []
+    chunks_per_sec = SAMPLE_RATE / CHUNK_SIZE
+    max_chunks = int(MAX_RECORD_SECS * chunks_per_sec)
+    try:
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE,
+        )
+        for _ in range(max_chunks):
+            if cancel_event.is_set() or stop_event.is_set():
+                break
+            data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            frames.append(np.frombuffer(data, dtype=np.int16).copy())
+        if cancel_event.is_set():
+            frames.clear()
+    finally:
+        try:
+            if stream is not None:
+                try:
+                    stream.stop_stream()
+                finally:
+                    stream.close()
+        finally:
+            pa.terminate()
+
+    if not frames:
+        return np.array([], dtype=np.int16)
+    return np.concatenate(frames).astype(np.int16)
+
+
 def _to_wav_bytes(audio_i16: np.ndarray) -> bytes:
     """Wrap raw int16 PCM as an in-memory WAV (for the Groq STT upload)."""
     buf = io.BytesIO()
@@ -293,6 +334,12 @@ async def transcribe() -> str:
     """
     loop = asyncio.get_running_loop()
     audio = await loop.run_in_executor(None, _record_until_silence)
+    return await transcribe_recording(audio)
+
+
+async def transcribe_recording(audio: np.ndarray) -> str:
+    """Transcribe an already-captured manual recording using the configured STT path."""
+    loop = asyncio.get_running_loop()
     secs = audio.size / SAMPLE_RATE
     if secs == 0:
         print("[Whisper] No audio captured (mic returned silence or speech timed out).",

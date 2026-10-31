@@ -3,8 +3,8 @@
 # J.A.R.V.I.S. for Windows
 
 **A voice assistant that actually does things on your PC.**
-Say *"Hey Jarvis"*, ask for something, and it answers out loud, drives a browser,
-clicks through desktop apps, and remembers you. All from one home screen.
+Use the microphone control to record a request, and it answers out loud, drives a
+browser, clicks through desktop apps, and remembers you. All from one home screen.
 
 [![CI](https://github.com/AnaaySampat/jarvis-windows/actions/workflows/ci.yml/badge.svg)](https://github.com/AnaaySampat/jarvis-windows/actions/workflows/ci.yml)
 ![Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078d4)
@@ -35,7 +35,7 @@ landed, and corrects itself when it didn't.
 
 | | |
 |---|---|
-| 🎙️ **Hands-free voice** | Local wake word ("Hey Jarvis") and local Whisper transcription. Push-to-talk with **Ctrl+Space** from any app. Full-duplex voice mode via Gemini Live. |
+| 🎙️ **Manual voice input** | Microphone capture starts only after a user action, stops on submit or cancel, and is bounded to 30 seconds. Wake-word detection and Gemini Live are not started by the desktop voice startup. |
 | 🧠 **Any model, routed for you** | Bring keys for Groq, Gemini, OpenRouter, NVIDIA NIM, Mistral, Claude, OpenAI, Grok or Meta Llama. **Auto** ranks your models by benchmark and picks per request, falling back when one is rate-limited. Vertex AI (Google Cloud login) and offline Ollama work too. |
 | 🌐 **Browser autopilot** | Goal in, result out. Runs in your own signed-in Chrome through the JARVIS extension (in its own tabs, never yours), or in a browser JARVIS owns, with approvals for anything risky. Watch every step and screenshot in the Agent Activity panel. |
 | 🖥️ **Desktop control** | Opens, closes and operates Windows apps through UI Automation. Off until you arm it, with a live "JARVIS CONTROLLING" bar to pause or correct it. |
@@ -313,8 +313,10 @@ can't cross into another router's network, so the sender has to be on the same o
 
 ## Privacy
 
-- Wake word and transcription run **on your PC**. Mic audio stays local, except in
-  the optional Gemini Live voice mode, which streams it to Google.
+- The desktop microphone remains idle at startup. Ordinary clips are held in RAM,
+  not saved to disk; the configured speech-to-text path may send audio to Groq and
+  currently may fall back to local Whisper. Wake-word detection and Gemini Live are
+  not started by the desktop voice startup.
 - What you say (as text), plus camera frames when you use OCR, goes to the AI
   provider you chose.
 - API keys and settings live in `%APPDATA%\Jarvis\`, never in the project folder.

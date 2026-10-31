@@ -67,7 +67,7 @@ function ClarifyPrompt({ request, onRespond }) {
 
 export default function App() {
   const {
-    status, messages, warnings, sysInfo, isConnected,
+    status, recordingState, recordingActionPending, messages, warnings, sysInfo, isConnected,
     telemetry, netInfo, weather, schedule, uiCommand, permissionRequest, clarifyRequest, muted,
     commands, recordings, browserState, controlState, screen, alwaysOn, conversationMode,
     overlay, agentTasks, conversations, setupProgress,
@@ -76,8 +76,9 @@ export default function App() {
     dismissWarning, clearAgentTasks, sendConfig, refreshModels, rerankModels, repairSetup, sendMessage,
     resetConversation, newConversation, openConversation, deleteConversation, listConversations, clearConversations,
     memory, listMemory, rememberFact, forgetMemory, saveRoutine, runRoutine, routineResult,
-    sendLocation, sendManualLocation, triggerListen, stopSpeech,
-    stopControl, finishListen, pttStart,
+    sendLocation, sendManualLocation, stopSpeech,
+    stopControl,
+    startRecording, stopRecording, cancelRecording,
     respondPermission, respondClarify, setMute, runAction, setBrowserOpen, sendUpload,
     sendScreen, setAlwaysOnMode, setConversationModeOn, wsSend,
   } = useWebSocket();
@@ -186,29 +187,6 @@ export default function App() {
     return () => { navigator.geolocation.clearWatch(watchId); clearTimeout(stop); };
   }, [sendLocation]);
 
-  // ── Global Ctrl+Space (registered in Rust) → push-to-talk ───────────────────
-  // Hold to talk: pressing emits "ptt-start" (begin recording, ignore silence),
-  // releasing emits "ptt-stop" (finish + transcribe what was said). Works even
-  // when JARVIS is in the background. "trigger-listen" is kept as a back-compat
-  // single-shot (tap-to-listen) in case an older binary emits it.
-  useEffect(() => {
-    const unlisteners = [];
-    let disposed = false;
-    (async () => {
-      try {
-        const { listen } = await import("@tauri-apps/api/event");
-        unlisteners.push(await listen("ptt-start", () => pttStart()));
-        unlisteners.push(await listen("ptt-stop", () => finishListen()));
-        unlisteners.push(await listen("trigger-listen", () => triggerListen()));
-        if (disposed) unlisteners.forEach((u) => u && u());
-      } catch { /* browser dev preview — no Tauri runtime */ }
-    })();
-    return () => {
-      disposed = true;
-      unlisteners.forEach((u) => u && u());
-    };
-  }, [pttStart, finishListen, triggerListen]);
-
   // ── Bring JARVIS to the front when it needs your approval ───────────────────
   // FALLBACK only: the floating overlay pill now shows the Approve/Deny card
   // wherever the user is, so the main window doesn't need to steal focus. Only
@@ -294,7 +272,6 @@ export default function App() {
       case "close_terminal": togglePanel("terminal", false); break;
       case "open_activity": case "activity": setActivityOpen(true); break;
       case "close_activity": setActivityOpen(false); break;
-      case "listen": case "mic": triggerListen(); break;
       case "stop_speaking": case "stop": stopSpeech(); break;
       case "clear_chat": case "new_conversation": case "reset": resetConversation(); break;
       default: break;
@@ -353,7 +330,6 @@ export default function App() {
       cmd("connectors", "Connections", "Connect an app (GitHub, Notion, Calendar…)", "plug", () => openSettings("connectors"),
         { keywords: "connectors integrations github notion google calendar todoist home assistant zapier brave folders" }),
 
-      cmd("listen", "Voice", "Start listening", "mic", triggerListen, { keywords: "talk speak microphone", keys: ["Ctrl", "Space"] }),
       cmd("stop", "Voice", "Stop speaking", "stop", stopSpeech, { keywords: "silence quiet interrupt" }),
       cmd("mute", "Voice", muted ? "Unmute JARVIS" : "Mute JARVIS (text only)", muted ? "volume" : "mute",
         () => setMute(!muted), { keywords: "sound silence voice", state: muted ? "Muted" : null }),
@@ -379,7 +355,7 @@ export default function App() {
       ...SETTINGS_PAGES.map(([id, label, icon, words]) => cmd(`settings-${id}`, "Settings", `Settings: ${label}`, icon,
         () => openSettings(id), { keywords: `preferences configure ${words}` })),
     ];
-  }, [recordings, runAction, newConversation, running, openSettings, triggerListen, stopSpeech, muted, setMute,
+  }, [recordings, runAction, newConversation, running, openSettings, stopSpeech, muted, setMute,
       alwaysOn, setAlwaysOnMode, conversationMode, setConversationModeOn, browserState.available, browserState.open,
       setBrowserOpen, setAllPanels, panels.terminal, togglePanel, memory?.routines, runRoutine, notify,
       sysInfo.agent_mode, sysInfo.active_agent, toggleAgentMode, pickAgent]);
@@ -478,6 +454,8 @@ export default function App() {
         screen={screen}
         onArrange={(order) => sendScreen({ order })}
         status={status}
+        recordingState={recordingState}
+        recordingActionPending={recordingActionPending}
         telemetry={telemetry}
         weather={weather}
         netInfo={netInfo}
@@ -498,7 +476,9 @@ export default function App() {
         onSend={sendMessage}
         onAsk={askInChat}
         onStop={stopSpeech}
-        onListen={triggerListen}
+        onStartRecording={startRecording}
+        onStopRecording={stopRecording}
+        onCancelRecording={cancelRecording}
         onReset={resetConversation}
         onUpload={sendUpload}
         onNotify={notify}

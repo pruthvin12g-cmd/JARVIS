@@ -46,8 +46,61 @@ export function reduceSetupProgress(prev, data) {
   return s;
 }
 
+export function reduceRecordingState(current, event, data) {
+  if (event === "disconnected") {
+    return { serverId: null, generation: -1, revision: -1, state: "idle" };
+  }
+  if (event !== "recording_state" || !data || typeof data !== "object"
+      || typeof data.server_id !== "string"
+      || !Number.isSafeInteger(data.generation)
+      || !Number.isSafeInteger(data.revision)
+      || !["idle", "recording", "transcribing", "cancelling"].includes(data.state)) {
+    return current;
+  }
+  if (data.server_id === current.serverId
+      && (data.generation < current.generation
+        || (data.generation === current.generation
+          && data.revision <= current.revision))) {
+    return current;
+  }
+  return {
+    serverId: data.server_id,
+    generation: data.generation,
+    revision: data.revision,
+    state: data.state,
+    requestId: data.request_id || null,
+    action: data.action || null,
+  };
+}
+
+export function isMatchingRecordingRejection(pending, data) {
+  return !!pending
+    && pending.action === data?.action
+    && typeof data?.request_id === "string"
+    && pending.requestId === data.request_id;
+}
+
+export function isMatchingRecordingAcceptance(pending, lifecycle) {
+  if (!pending || lifecycle?.requestId !== pending.requestId
+      || lifecycle.action !== pending.action) return false;
+  return (pending.action === "start" && lifecycle.state === "recording")
+    || (pending.action === "stop" && lifecycle.state === "transcribing")
+    || (pending.action === "cancel" && lifecycle.state === "idle");
+}
+
+export function resolveRecordingPending(pending, event, data) {
+  if (event === "disconnected") return null;
+  if (event === "recording_state"
+      && isMatchingRecordingAcceptance(pending, data)) return null;
+  if (event === "recording_rejected"
+      && isMatchingRecordingRejection(pending, data)) return null;
+  return pending;
+}
+
 export function useWebSocket() {
   const [status, setStatus]         = useState("idle");
+  const [recordingState, setRecordingState] = useState("idle");
+  const [recordingActionPending, setRecordingActionPending] = useState(false);
   const [messages, setMessages]     = useState([]);
   const [warnings, setWarnings]     = useState([]);
   const [sysInfo, setSysInfo]       = useState({ model_override: "", tts: "edge-tts", wakeWord: "hey_jarvis", ram: null, vram: null });
@@ -86,6 +139,11 @@ export function useWebSocket() {
   const wsRef      = useRef(null);
   const wsUrlRef   = useRef(null);
   const retryTimer = useRef(null);
+  const recordingStateRef = useRef("idle");
+  const recordingLifecycleRef = useRef({
+    serverId: null, generation: -1, revision: -1, state: "idle",
+  });
+  const recordingCommandRef = useRef(null);
 
   const connect = useCallback(() => {
     const url = wsUrlRef.current;
@@ -118,6 +176,34 @@ export function useWebSocket() {
           case "status":
             setStatus(msg.data);
             break;
+          case "recording_state": {
+            const next = reduceRecordingState(
+              recordingLifecycleRef.current, "recording_state", msg.data);
+            if (next === recordingLifecycleRef.current) break;
+            recordingLifecycleRef.current = next;
+            recordingStateRef.current = next.state;
+            setRecordingState(next.state);
+            const pending = recordingCommandRef.current;
+            recordingCommandRef.current = resolveRecordingPending(
+              pending, "recording_state", next);
+            if (pending && !recordingCommandRef.current) {
+              setRecordingActionPending(false);
+            }
+            break;
+          }
+          case "recording_rejected": {
+            const pending = recordingCommandRef.current;
+            recordingCommandRef.current = resolveRecordingPending(
+              pending, "recording_rejected", msg.data);
+            if (pending && !recordingCommandRef.current) {
+              setRecordingActionPending(false);
+              setWarnings(prev => [...prev, {
+                text: msg.data.message || "Recording could not be started.",
+                id: Date.now() + Math.random(),
+              }]);
+            }
+            break;
+          }
           case "transcription": {
             // Normal pipeline sends a plain string → one user bubble per turn.
             // Native-audio sends {text, uid} as the live transcript builds, so we
@@ -220,6 +306,7 @@ export function useWebSocket() {
             });
             break;
           case "warning":
+          case "error":
             setWarnings(prev => [...prev, { text: msg.data, id: Date.now() + Math.random() }]);
             break;
           case "update_available":
@@ -359,6 +446,14 @@ export function useWebSocket() {
         // Guard against stale sockets (React StrictMode mounts effects twice)
         if (wsRef.current !== ws) return;
         setIsConnected(false);
+        recordingLifecycleRef.current = reduceRecordingState(
+          recordingLifecycleRef.current, "disconnected");
+        recordingStateRef.current = recordingLifecycleRef.current.state;
+        setStatus("idle");
+        setRecordingState("idle");
+        recordingCommandRef.current = resolveRecordingPending(
+          recordingCommandRef.current, "disconnected");
+        setRecordingActionPending(false);
         retryTimer.current = setTimeout(connect, RECONNECT_MS);
       };
 
@@ -454,21 +549,31 @@ export function useWebSocket() {
     wsSend({ type: "text_input", data: text });
   }, [wsSend]);
 
-  const triggerListen = useCallback(() => {
-    wsSend({ type: "trigger_listen" });
+  const startRecording = useCallback(() => {
+    if (recordingStateRef.current !== "idle" || recordingCommandRef.current) return false;
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if (!wsSend({ type: "start_recording", data: { request_id: requestId } })) return false;
+    recordingCommandRef.current = { action: "start", requestId };
+    setRecordingActionPending(true);
+    return true;
   }, [wsSend]);
 
-  // End the current listening turn now and transcribe what was captured (overlay
-  // ✓ button, and push-to-talk key release). Distinct from stopSpeech, which
-  // cancels/drops the turn.
-  const finishListen = useCallback(() => {
-    wsSend({ type: "finish_listen" });
+  const stopRecording = useCallback(() => {
+    if (recordingStateRef.current !== "recording" || recordingCommandRef.current) return false;
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if (!wsSend({ type: "stop_recording", data: { request_id: requestId } })) return false;
+    recordingCommandRef.current = { action: "stop", requestId };
+    setRecordingActionPending(true);
+    return true;
   }, [wsSend]);
 
-  // Push-to-talk start (Ctrl+Space pressed): records until release (finishListen),
-  // ignoring silence so a pause mid-sentence doesn't cut you off.
-  const pttStart = useCallback(() => {
-    wsSend({ type: "trigger_listen", data: { ptt: true } });
+  const cancelRecording = useCallback(() => {
+    if (recordingStateRef.current !== "recording" || recordingCommandRef.current) return false;
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if (!wsSend({ type: "cancel_recording", data: { request_id: requestId } })) return false;
+    recordingCommandRef.current = { action: "cancel", requestId };
+    setRecordingActionPending(true);
+    return true;
   }, [wsSend]);
 
   const stopSpeech = useCallback(() => {
@@ -659,14 +764,16 @@ export function useWebSocket() {
   }, [wsSend]);
 
   return {
-    status, messages, warnings, sysInfo, isConnected, wakeTriggered, ocrResult,
+    status, recordingState, recordingActionPending,
+    messages, warnings, sysInfo, isConnected, wakeTriggered, ocrResult,
     telemetry, netInfo, weather, schedule, uiCommand, permissionRequest, clarifyRequest, muted,
     commands, recordings, browserState, controlState, screen, alwaysOn, conversationMode,
     activeApp, overlay, agentTasks, conversations, setupProgress,
     devicePairing, devices, tvState, waState, mcpState, connState,
     createPairing, listDevices, revokeDevice,
-    dismissWarning, clearAgentTasks, sendConfig, refreshModels, rerankModels, repairSetup, sendMessage, sendCommand, triggerListen, stopSpeech,
-    stopControl, pauseControl, sendCorrection, finishListen, pttStart,
+    dismissWarning, clearAgentTasks, sendConfig, refreshModels, rerankModels, repairSetup, sendMessage, sendCommand, stopSpeech,
+    startRecording, stopRecording, cancelRecording,
+    stopControl, pauseControl, sendCorrection,
     resetConversation, newConversation, openConversation, deleteConversation, listConversations, clearConversations,
     memory, listMemory, rememberFact, forgetMemory, saveRoutine, runRoutine, routineResult,
     sendOcr, sendLocation, sendManualLocation, respondPermission, respondClarify, setMute, runAction,

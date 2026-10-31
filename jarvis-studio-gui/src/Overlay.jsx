@@ -54,7 +54,10 @@ function shouldShow(activeApp, overlay) {
 }
 
 const STATE_LABEL = {
-  idle: "STANDBY",
+  idle: "MIC OFF",
+  recording: "RECORDING",
+  transcribing: "TRANSCRIBING",
+  cancelling: "CANCELLING",
   listening: "LISTENING",
   thinking: "THINKING",
   speaking: "SPEAKING",
@@ -141,12 +144,14 @@ function accentToRgb(accent) {
 
 export default function Overlay() {
   const {
-    status, stopSpeech, triggerListen, finishListen, activeApp, overlay, screen,
-    permissionRequest, respondPermission,
+    status, recordingState, recordingActionPending, isConnected,
+    startRecording, stopRecording, cancelRecording, stopSpeech,
+    activeApp, overlay, screen, permissionRequest, respondPermission,
   } = useWebSocket();
 
   const previewStatus = new URLSearchParams(window.location.search).get("status");
-  const displayStatus = previewStatus || status;
+  const displayStatus = previewStatus
+    || (recordingState !== "idle" ? recordingState : status);
   const busy = displayStatus !== "idle";
   // An Approve/Deny request OVERRIDES the normal show rules — hide-list, idle
   // state, AND the on-JARVIS exclusion: the user MUST see it wherever they are.
@@ -171,21 +176,17 @@ export default function Overlay() {
     applyWindow(visible, busy, permPending);
   }, [visible, busy, permPending]);
 
-  const handleListen = useCallback((e) => {
+  const handlePrimary = useCallback((e) => {
     e?.stopPropagation();
-    triggerListen();
-  }, [triggerListen]);
+    if (displayStatus === "recording") stopRecording();
+    else if (displayStatus === "idle") startRecording();
+    else if (displayStatus !== "transcribing") stopSpeech();
+  }, [displayStatus, startRecording, stopRecording, stopSpeech]);
 
-  const handleStop = useCallback((e) => {
+  const handleCancel = useCallback((e) => {
     e?.stopPropagation();
-    stopSpeech();
-  }, [stopSpeech]);
-
-  // ✓ — finish listening now and process what was said (vs. ✕ which cancels).
-  const handleCommit = useCallback((e) => {
-    e?.stopPropagation();
-    finishListen();
-  }, [finishListen]);
+    cancelRecording();
+  }, [cancelRecording]);
 
   // Floating Approve/Deny card — replaces the pill while a request is pending.
   if (permPending) {
@@ -217,8 +218,16 @@ export default function Overlay() {
       <div
         className={`pill pill--${displayStatus}${busy ? " is-busy" : ""}`}
         style={{ color: accent, "--pill-rgb": accentRgb }}
-        title={busy ? displayStatus : "Tap to talk to JARVIS"}
-        onClick={busy ? undefined : handleListen}
+        title={displayStatus === "idle"
+          ? "Microphone off. Tap to start recording."
+          : displayStatus === "recording"
+            ? "Tap to stop and submit recording."
+            : displayStatus === "transcribing"
+              ? "Transcribing recording."
+              : displayStatus}
+        onClick={isConnected && !recordingActionPending
+          && (displayStatus === "idle" || displayStatus === "recording")
+          ? handlePrimary : undefined}
       >
         <div className="pill-face">
           <div className="pill-carbon" />
@@ -234,24 +243,30 @@ export default function Overlay() {
             <span>{STATE_LABEL[displayStatus] || String(displayStatus).toUpperCase()}</span>
           </div>
 
-          {displayStatus === "listening" && (
+          {displayStatus === "recording" && (
             <div className="pill-listen-controls">
-              <button className="pill-action pill-action--cancel" title="Cancel listening" aria-label="Cancel listening" onClick={handleStop}>x</button>
+              <button
+                className="pill-action pill-action--cancel"
+                title="Cancel and discard recording"
+                aria-label="Cancel recording"
+                disabled={recordingActionPending || !isConnected}
+                onClick={handleCancel}
+              >x</button>
               <div className="pill-wave pill-wave--listening" aria-hidden="true">
                 <WaveBars />
               </div>
-              <button className="pill-action pill-action--ok" title="Done — process now" aria-label="Finish listening" onClick={handleCommit} />
             </div>
           )}
 
-          {busy && displayStatus !== "listening" && (
+          {busy && displayStatus !== "recording" && (
             <div className="pill-wave" aria-hidden="true">
               <WaveBars />
             </div>
           )}
 
-          {busy && displayStatus !== "listening" && (
-            <button className="pill-stop" title="Stop" aria-label="Stop" onClick={handleStop}>x</button>
+          {busy && displayStatus !== "recording" && displayStatus !== "transcribing"
+            && displayStatus !== "cancelling" && (
+            <button className="pill-stop" title="Stop" aria-label="Stop" onClick={handlePrimary}>x</button>
           )}
         </div>
       </div>

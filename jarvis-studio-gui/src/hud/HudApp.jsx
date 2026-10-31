@@ -29,7 +29,10 @@ export const DIRECTIONS = [
 ];
 
 const STATUS_TEXT = {
-  idle:      ["Standing by", "Say “Hey Jarvis”, hold Ctrl+Space, or click the orb."],
+  idle:      ["Standing by", "Microphone off. Click the microphone to start recording."],
+  recording: ["Recording…", "Click the microphone to submit, or cancel to discard."],
+  transcribing: ["Transcribing…", "Please wait while the recording is transcribed."],
+  cancelling: ["Cancelling…", "Discarding the recording and closing the microphone."],
   listening: ["Listening…", "Go ahead — click the orb to cancel."],
   thinking:  ["Thinking…", "Click the orb to stop."],
   speaking:  ["Speaking", "Click the orb to stop."],
@@ -66,7 +69,11 @@ function HeroClock() {
 }
 
 /* The ask box: a message goes straight to JARVIS and the reply appears above it. */
-function AskBar({ inputRef, onSend, onListen, status, placeholder = "Ask JARVIS anything…" }) {
+function AskBar({
+  inputRef, onSend, onStartRecording, onStopRecording, onCancelRecording,
+  recordingState, recordingActionPending, isConnected, status,
+  placeholder = "Ask JARVIS anything…",
+}) {
   const [text, setText] = useState("");
   const submit = (e) => {
     e.preventDefault();
@@ -80,10 +87,32 @@ function AskBar({ inputRef, onSend, onListen, status, placeholder = "Ask JARVIS 
       <input ref={inputRef} value={text} onChange={(e) => setText(e.target.value)}
              placeholder={placeholder} aria-label="Ask JARVIS" />
       {!text && <kbd className="ask-kbd" title="Press / to type here">/</kbd>}
-      <button type="button" className={`ask-btn${status === "listening" ? " is-on" : ""}`}
-              onClick={onListen} aria-label="Talk" title="Talk (or hold Ctrl+Space)">
+      <button
+        type="button"
+        className={`ask-btn${recordingState === "recording" ? " is-on" : ""}`}
+        onClick={recordingState === "recording" ? onStopRecording : onStartRecording}
+        disabled={!isConnected || recordingActionPending
+          || recordingState === "transcribing"
+          || recordingState === "cancelling"
+          || (recordingState !== "recording" && status !== "idle")}
+        aria-label={recordingState === "recording" ? "Stop and submit recording" : "Start recording"}
+        aria-pressed={recordingState === "recording"}
+        title={recordingState === "recording"
+          ? "Stop and submit recording"
+          : "Microphone off. Click to start recording."}
+      >
         <Icon name="mic" size={17} />
       </button>
+      {recordingState === "recording" && (
+        <button
+          type="button"
+          className="ask-btn ask-btn--cancel"
+          onClick={onCancelRecording}
+          disabled={recordingActionPending}
+          aria-label="Cancel recording"
+          title="Cancel and discard recording"
+        >×</button>
+      )}
       <button type="submit" className="ask-btn ask-btn--send" disabled={!text.trim()} aria-label="Send" title="Send">
         <Icon name="send" size={17} />
       </button>
@@ -105,6 +134,8 @@ export function JarvisHUD({
   toolbar,                      // the quick controls (App owns their state)
   // live data
   status = "idle",
+  recordingState = "idle",
+  recordingActionPending = false,
   activeTask,                   // the running autopilot task {goal, source, …}, if any
   agentMode = false,            // agent mode (agents.py): the Agents switch and the agent row
   activeAgent = "auto",         // the agent picked on the row ("auto" = the coordinator)
@@ -132,7 +163,9 @@ export function JarvisHUD({
   onAsk,                        // send a message and show the chat (Capabilities "Try")
   onNotify,                     // brief confirmation toast
   onStop,
-  onListen,
+  onStartRecording,
+  onStopRecording,
+  onCancelRecording,
   onReset,
   onUpload,
   taskModelTiers = [],
@@ -209,7 +242,8 @@ export function JarvisHUD({
 
   // A task from the phone runs without a turn of its own here, so the status can be
   // idle while it works: the running task still says what JARVIS is doing.
-  const shownStatus = status === "idle" && activeTask ? "working" : status;
+  const voiceStatus = recordingState !== "idle" ? recordingState : status;
+  const shownStatus = voiceStatus === "idle" && activeTask ? "working" : voiceStatus;
   const [title, orbHint] = STATUS_TEXT[shownStatus] || STATUS_TEXT.idle;
   const hint = reactor ? orbHint.replace("the orb", "the reactor") : orbHint;
   const busy = shownStatus !== "idle";
@@ -261,8 +295,21 @@ export function JarvisHUD({
 
         <section className="home-hero" aria-label="JARVIS">
           <HeroClock />
-          <Core status={shownStatus} rgb={c.rgb} onClick={busy ? onStop : onListen}
-                label={busy ? "Stop" : "Talk to JARVIS"} />
+          <Core
+            status={shownStatus}
+            rgb={c.rgb}
+            onClick={recordingState === "recording"
+              ? onStopRecording
+              : busy ? onStop : onStartRecording}
+            disabled={!isConnected || recordingActionPending
+              || recordingState === "transcribing"
+              || recordingState === "cancelling"}
+            label={recordingState === "recording"
+              ? "Stop and submit recording"
+              : recordingState === "transcribing"
+                ? "Transcribing"
+                : shownStatus === "idle" ? "Microphone off. Start recording" : "Stop"}
+          />
           <div className="hero-status" role="status">
             {hudCards && <Waveform status={shownStatus} />}
             <div className={`hero-title hero-title--${shownStatus}`}><span className="hero-dot" />{title}</div>
@@ -283,9 +330,19 @@ export function JarvisHUD({
           )}
 
           {agentMode && <AgentRow active={activeAgent} onPick={onPickAgent} />}
-          <AskBar inputRef={askRef} onSend={(t) => onSend(t)} onListen={onListen} status={status}
-                  placeholder={agentMode && activeAgent !== "auto"
-                    ? `Ask the ${agentPick(activeAgent).name} agent…` : "Ask JARVIS anything…"} />
+          <AskBar
+            inputRef={askRef}
+            onSend={(t) => onSend(t)}
+            onStartRecording={onStartRecording}
+            onStopRecording={onStopRecording}
+            onCancelRecording={onCancelRecording}
+            recordingState={recordingState}
+            recordingActionPending={recordingActionPending}
+            isConnected={isConnected}
+            status={shownStatus}
+            placeholder={agentMode && activeAgent !== "auto"
+              ? `Ask the ${agentPick(activeAgent).name} agent…` : "Ask JARVIS anything…"}
+          />
 
           {messages.length === 0 && (
             <div className="hero-starters">

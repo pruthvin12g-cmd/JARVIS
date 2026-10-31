@@ -934,6 +934,18 @@ async def _run_handler(fn: Callable[..., Awaitable], data, event_type: str) -> N
         client = current_sender()
         if client is not None:
             try:
+                action = {
+                    "start_recording": "start",
+                    "stop_recording": "stop",
+                    "cancel_recording": "cancel",
+                }.get(event_type)
+                request_id = data.get("request_id") if isinstance(data, dict) else None
+                if action and isinstance(request_id, str) and request_id:
+                    await send_to(client, "recording_rejected", {
+                        "request_id": request_id,
+                        "action": action,
+                        "message": f"Recording action failed: {exc}",
+                    })
                 await send_to(client, "warning", f"Backend handler '{event_type}' failed: {exc}")
                 await send_to(client, "status", "idle")
             except Exception:  # noqa: BLE001
