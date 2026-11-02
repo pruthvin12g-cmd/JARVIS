@@ -43,14 +43,9 @@ def set_ptt(on: bool) -> None:
     else:
         _ptt_mode.clear()
 
-# Which speech-to-text engine to use: "groq" (Groq Whisper Turbo, cloud) with a
-# local fallback, or "local" (offline faster-whisper). Set by main from config.
-_stt_mode = "groq"
+class GroqTranscriptionError(RuntimeError):
+    """A selected Groq STT request could not produce a usable transcript."""
 
-
-def set_stt(mode: str) -> None:
-    global _stt_mode
-    _stt_mode = "local" if str(mode).lower() == "local" else "groq"
 
 SAMPLE_RATE = 16_000
 CHUNK_SIZE = 1280           # 80 ms frames — same as wake word detector
@@ -318,10 +313,9 @@ def _do_transcribe(audio_i16: np.ndarray, prompt: str = "") -> str:
 
 
 async def preload() -> None:
-    """Warm the local Whisper model so the offline fallback (used when Groq STT
-    fails or when STT is set to 'local') is instant instead of stalling ~40s on
-    first use. Runs in an executor; main() schedules this as a background task so
-    it never blocks startup — including the wake-word loop."""
+    """Warm the local Whisper model so explicitly selected local STT is instant
+    instead of stalling ~40s on first use. Runs in an executor; main() schedules
+    this as a background task so it never blocks startup."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _get_model)
 
@@ -348,30 +342,20 @@ async def transcribe_recording(audio: np.ndarray) -> str:
     else:
         print(f"[Whisper] Captured {secs:.1f}s of audio; transcribing…", flush=True)
 
-    from llm.groq_bridge import get_stt, transcribe_audio
-    if _stt_mode == "groq" and get_stt() == "groq":
-        wav_bytes = _to_wav_bytes(audio)
-        text = await transcribe_audio(wav_bytes)
-        if text:
-            return text
-        if text is None:
-            print("[Whisper] Groq transcription failed; falling back to local model.", flush=True)
-        else:
-            print("[Whisper] Groq transcription returned empty; falling back to local model.", flush=True)
+    from llm.groq_bridge import get_stt
+    if get_stt() == "groq":
+        return await _transcribe_groq(_to_wav_bytes(audio))
 
     return await loop.run_in_executor(None, _do_transcribe, audio)
 
 
 async def transcribe_voice_note(data: bytes) -> str:
-    """A WhatsApp voice note (Ogg/Opus) → text: Groq first, else the local model,
-    which decodes the file itself (PyAV)."""
+    """Transcribe a WhatsApp voice note using the configured STT provider."""
     if not data:
         return ""
-    from llm.groq_bridge import get_stt, transcribe_audio
-    if _stt_mode == "groq" and get_stt() == "groq":
-        text = await transcribe_audio(data, prompt="Jarvis", filename="voice.ogg")
-        if text is not None:
-            return text
+    from llm.groq_bridge import get_stt
+    if get_stt() == "groq":
+        return await _transcribe_groq(data, prompt="Jarvis", filename="voice.ogg")
 
     def _local() -> str:
         segments, _ = _get_model().transcribe(io.BytesIO(data), language="en", beam_size=1,
@@ -381,6 +365,28 @@ async def transcribe_voice_note(data: bytes) -> str:
     return await asyncio.get_running_loop().run_in_executor(None, _local)
 
 
+async def _transcribe_groq(data: bytes, prompt: str = "",
+                           filename: str = "speech.wav") -> str:
+    from llm.groq_bridge import has_groq_key, transcribe_audio
+
+    if not has_groq_key():
+        raise GroqTranscriptionError(
+            "Groq is selected, but the Groq API key is unavailable. "
+            "Add a Groq API key or explicitly select local speech recognition."
+        )
+    try:
+        text = await transcribe_audio(data, prompt=prompt, filename=filename)
+    except Exception as exc:  # noqa: BLE001
+        raise GroqTranscriptionError(
+            "Groq transcription failed. Check your connection and try again."
+        ) from exc
+    if not text or not text.strip():
+        raise GroqTranscriptionError(
+            "Groq could not transcribe this recording. Please try again."
+        )
+    return text.strip()
+
+
 async def transcribe_clip(audio: np.ndarray) -> str:
     """Transcribe a clip the wake detector recorded (the 3 s before "Hey Jarvis" plus
     the command). The hint is the name alone, never "Hey Jarvis": Whisper can echo
@@ -388,11 +394,8 @@ async def transcribe_clip(audio: np.ndarray) -> str:
     if audio.size == 0:
         return ""
     print(f"[Whisper] Wake clip of {audio.size / SAMPLE_RATE:.1f}s; transcribing…", flush=True)
-    from llm.groq_bridge import get_stt, transcribe_audio
-    if _stt_mode == "groq" and get_stt() == "groq":
-        text = await transcribe_audio(_to_wav_bytes(audio), prompt="Jarvis")
-        if text is not None:
-            return text
-        print("[Whisper] Groq transcription failed; falling back to local model.", flush=True)
+    from llm.groq_bridge import get_stt
+    if get_stt() == "groq":
+        return await _transcribe_groq(_to_wav_bytes(audio), prompt="Jarvis")
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _do_transcribe, audio, "Jarvis")

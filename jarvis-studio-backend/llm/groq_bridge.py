@@ -218,6 +218,30 @@ def _add_reasoning(payload: dict) -> dict:
         payload["reasoning_effort"] = _REASONING_EFFORT
     return payload
 
+
+def _safe_groq_error_body(body: str, limit: int = 2000) -> str:
+    """Bound and redact credential-like values before logging a Groq error body."""
+    detail = str(body or "")
+    detail = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]", detail)
+    detail = re.sub(r"\bgsk_[A-Za-z0-9_-]+", "[REDACTED]", detail)
+    detail = re.sub(
+        r'(?i)("(?:authorization|api[_-]?key|access[_-]?token|secret|password)"\s*:\s*)"[^"]*"',
+        r'\1"[REDACTED]"', detail,
+    )
+    return detail[:limit]
+
+
+def _log_groq_http_error(context: str, status: int, body: str,
+                         include_body: bool = True) -> None:
+    """Log bounded, redacted error details; request headers are never logged."""
+    if not include_body:
+        print(f"[Groq] {context} HTTP {status}.", flush=True)
+        return
+    detail = _safe_groq_error_body(body)
+    print(f"[Groq] {context} HTTP {status}: "
+          f"{detail or '(empty response body)'}", flush=True)
+
+
 # Shared voice + a dense capability map. The old prompt was ~4k tokens of essays
 # the model skimmed; this is short enough to stay in working memory AND names every
 # real power so it knows what it can do without the JSON catalog.
@@ -586,8 +610,8 @@ DEFAULT_CONFIG = {
     # Proactive system alerts (CPU/RAM/battery spoken warnings). OFF by default —
     # many users find the CPU/RAM ones noisy; toggle on in Settings if wanted.
     "system_alerts": False,
-    # Speech-to-text engine: "groq" = Groq Whisper Turbo (cloud, accurate, needs
-    # the Groq key) with a local fallback; "local" = offline faster-whisper.
+    # Speech-to-text engine: "groq" = Groq Whisper Turbo (cloud, requires a key);
+    # "local" = offline faster-whisper.
     "stt": "groq",
     # Vertex AI (Gemini on Google Cloud) — serves Gemini via the user's ADC login
     # so usage draws from their GCP project + trial credits instead of an API key.
@@ -770,12 +794,14 @@ def set_system_alerts(on: bool) -> bool:
 
 
 def get_stt() -> str:
-    """Effective speech-to-text engine: 'groq' only if that's selected AND a Groq
-    key exists; otherwise 'local' (offline faster-whisper)."""
+    """Return the configured speech-to-text engine, independent of key availability."""
     pref = (_config.get("stt") or "groq").lower()
-    if pref == "groq" and _api_key:
-        return "groq"
-    return "local"
+    return "local" if pref == "local" else "groq"
+
+
+def has_groq_key() -> bool:
+    """Whether a Groq API key is configured, without exposing its value."""
+    return bool(_api_key)
 
 
 def set_stt(mode: str) -> str:
@@ -789,7 +815,7 @@ async def transcribe_audio(wav_bytes: bytes, prompt: str = "",
     """Transcribe spoken audio via Groq Whisper (whisper-large-v3-turbo).
 
     Returns the recognised text, or None on any failure (no key, network, bad
-    response) so the caller can fall back to the local model. Never raises.
+    response). Never raises.
     ``prompt`` is Whisper's vocabulary hint; ``filename``'s extension tells Groq the
     format (a WhatsApp voice note is Ogg/Opus)."""
     if not _api_key or not wav_bytes:
@@ -809,12 +835,14 @@ async def transcribe_audio(wav_bytes: bytes, prompt: str = "",
                             "audio/ogg" if filename.endswith(".ogg") else "audio/wav")},
         )
         if resp.status_code != 200:
-            print(f"[STT] Groq transcription HTTP {resp.status_code}: "
-                  f"{resp.text[:200]}", flush=True)
+            _log_groq_http_error(
+                "STT transcription", resp.status_code, resp.text,
+                include_body=False,
+            )
             return None
         return (resp.json().get("text") or "").strip()
     except Exception as exc:  # noqa: BLE001
-        print(f"[STT] Groq transcription failed: {exc}", flush=True)
+        print(f"[STT] Groq transcription failed ({type(exc).__name__}).", flush=True)
         return None
 
 
@@ -1744,10 +1772,11 @@ async def initialize():
                               f"this plan's list; using it anyway.")
                     print(f"[Groq] Connected.")
                 elif resp.status_code in (401, 403):
+                    _log_groq_http_error("Models check", resp.status_code, resp.text)
                     await emit("warning", "Groq API key rejected (401/403). Check the key.")
                     print(f"[Groq] Auth failed: {resp.status_code}")
                 else:
-                    print(f"[Groq] Models check returned {resp.status_code}.")
+                    _log_groq_http_error("Models check", resp.status_code, resp.text)
         except Exception as exc:
             print(f"[Groq] Could not reach Groq at startup: {exc}")
 
@@ -2598,6 +2627,8 @@ async def _complete(route: "quota.Route", messages: list, max_tokens: int,
 
     quota.note_response(route, resp.status_code, resp.headers)
     if resp.status_code != 200:
+        if route.provider == "groq":
+            _log_groq_http_error("Chat completion", resp.status_code, resp.text)
         raise RouteError(f"{route.provider} HTTP {resp.status_code}",
                          status=resp.status_code,
                          retry_after=_retry_after(resp), detail=resp.text[:2000])
@@ -2607,14 +2638,13 @@ async def _complete(route: "quota.Route", messages: list, max_tokens: int,
 
 def _openai_request(route: "quota.Route", messages: list, max_tokens: int,
                     temperature: float, stream: bool) -> "tuple[str, dict, dict]":
-    """(url, headers, payload) for an OpenAI-compatible provider. Groq keeps its
-    exact historical payload (max_completion_tokens + reasoning_effort on gpt-oss);
-    the others get the portable subset — Mistral documents only ``max_tokens``, and
-    an unknown field is a 400 on the strict ones."""
+    """Build the provider-specific payload for an OpenAI-compatible endpoint."""
     payload = {"model": split_model(route.model)[1], "messages": messages,
                "temperature": temperature, "stream": stream}
     if route.provider == "groq":
         payload["max_completion_tokens"] = max_tokens
+        if _is_reasoning_model(payload["model"]):
+            payload.pop("temperature", None)
         _add_reasoning(payload)
     elif route.provider == "openai":
         # OpenAI's reasoning models (o-series, gpt-5) reject max_tokens and any
@@ -3173,6 +3203,9 @@ async def _stream_route(route: "quota.Route", messages: list, max_tokens: int,
             quota.note_response(route, resp.status_code, resp.headers)
             if resp.status_code != 200:
                 await resp.aread()
+                if route.provider == "groq":
+                    _log_groq_http_error("Chat completion", resp.status_code,
+                                         resp.text)
                 # A model that turns out not to support tool calling: remember it,
                 # so later action turns route past it instead of re-paying this 400.
                 if use_tools and resp.status_code == 400 and _rejects_tools(resp.text):

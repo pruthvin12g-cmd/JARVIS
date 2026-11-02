@@ -1,4 +1,5 @@
 # ── Secrets (never commit API keys / credentials) ───────────────────────────
+jarvis-studio-backend/.env
 jarvis-studio-backend/secrets.json
 jarvis-studio-backend/config.json
 jarvis-studio-backend/schedule.json

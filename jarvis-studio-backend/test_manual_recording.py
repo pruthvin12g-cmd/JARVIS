@@ -101,6 +101,22 @@ class ManualRecordingLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.pipeline_mock.assert_not_awaited()
         self.assertEqual(main._recording_state, "idle")
 
+    async def test_groq_transcription_error_is_shown_without_crashing_worker(self):
+        message = "Groq transcription failed. Check your connection and try again."
+        self.transcribe_mock.side_effect = main.GroqTranscriptionError(message)
+        await main.handle_start_recording()
+        await self._wait_for_capture()
+        task = main._recording_task
+        await main.handle_stop_recording()
+        await task
+
+        self.assertIn(
+            mock.call("response", message),
+            self.emit_mock.await_args_list,
+        )
+        self.assertEqual(main._recording_state, "idle")
+        self.pipeline_mock.assert_not_awaited()
+
     async def test_disconnect_cancels_active_capture(self):
         release_capture = threading.Event()
 

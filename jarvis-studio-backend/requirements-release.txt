@@ -8,6 +8,7 @@
 # ── core / transport ──
 websockets>=12.0
 httpx>=0.27.0
+python-dotenv>=1.0.0
 cryptography>=42.0     # remote-control crypto identity (Tailscale phone pairing)
 numpy>=1.24
 pillow>=10.0.0

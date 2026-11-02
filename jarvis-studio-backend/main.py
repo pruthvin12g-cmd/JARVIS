@@ -11,6 +11,10 @@ import threading
 import time
 import uuid
 
+from backend_env import load_backend_env
+
+load_backend_env()
+
 # LLM responses contain Unicode the Windows console can't encode by default
 # (em-dashes, non-breaking hyphens "‑", emoji), which makes print() raise
 # UnicodeEncodeError under the default cp1252 codec and aborts the pipeline.
@@ -133,7 +137,7 @@ def _setup_snapshot_for_replay():
 from wake_word.base import WakeWordDetector
 from transcription.whisper_transcriber import (
     transcribe, transcribe_clip, transcribe_voice_note, preload as preload_whisper,
-    record_manual_audio, transcribe_recording,
+    record_manual_audio, transcribe_recording, GroqTranscriptionError,
 )
 from wake_word.capture import command_after_wake, is_noise as is_noise_transcript
 from tts.tts_engine import TTSEngine
@@ -3546,6 +3550,9 @@ async def _manual_recording_worker(generation: int, stop_event: threading.Event,
             await emit("response", "I couldn't make out any speech in that recording.")
             return
         await _run_pipeline(text, emit_transcription=True)
+    except GroqTranscriptionError as exc:
+        print(f"[Voice] Manual recording transcription failed: {exc}", flush=True)
+        await emit("response", str(exc))
     except Exception as exc:  # noqa: BLE001
         print(f"[Voice] Manual recording failed: {exc}", flush=True)
         await emit("response", "I couldn't complete that recording. Please try again.")
@@ -3846,9 +3853,7 @@ async def handle_set_config(data) -> None:
         _tts.set_backend(data["tts"])
     if "stt" in data:
         from llm.groq_bridge import set_stt as set_groq_stt
-        from transcription.whisper_transcriber import set_stt as set_whisper_stt
         set_groq_stt(data["stt"])
-        set_whisper_stt(data["stt"])
     # API keys (onboarding + Settings). Stored in the git-ignored secret store,
     # never echoed back. Blank values are ignored by set_api_keys.
     from llm.groq_bridge import PREFIXED_PROVIDERS

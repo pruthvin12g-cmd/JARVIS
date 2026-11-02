@@ -2,9 +2,13 @@
 recomputed whenever the reachable models change, and a good-enough-first ladder
 with cross-provider fallbacks."""
 
+import asyncio
+import io
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -148,6 +152,112 @@ class RoutingWireTests(unittest.TestCase):
                 quota.Route("groq", "openai/gpt-oss-20b", 0), [], 100, 0.2, False)
             self.assertEqual((body["max_completion_tokens"], body["reasoning_effort"]),
                              (100, gb._REASONING_EFFORT))
+            self.assertNotIn("temperature", body)
+            self.assertEqual(body["model"], "openai/gpt-oss-20b")
+            self.assertEqual(body["stream"], False)
+            self.assertEqual(
+                gb._openai_request(
+                    quota.Route("groq", "llama-3.3-70b-versatile", 0),
+                    [], 100, 0.2, True,
+                )[2]["temperature"],
+                0.2,
+            )
+
+    def test_groq_error_logging_redacts_credentials_and_bounds_body(self):
+        body = (
+            '{"message":"bad payload","authorization":"Bearer secret-token",'
+            '"api_key":"gsk_example-secret"}'
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            gb._log_groq_http_error("Chat completion", 400, body)
+        logged = output.getvalue()
+        self.assertIn('"message":"bad payload"', logged)
+        self.assertNotIn("secret-token", logged)
+        self.assertNotIn("gsk_example-secret", logged)
+        self.assertIn("[REDACTED]", logged)
+
+        bounded = gb._safe_groq_error_body("x" * 2500)
+        self.assertEqual(len(bounded), 2000)
+
+    def test_groq_stream_http_error_logs_sanitized_response_body(self):
+        body = '{"error":{"message":"invalid field","api_key":"gsk_fake-secret"}}'
+
+        class FakeResponse:
+            status_code = 400
+            headers = {}
+            text = body
+
+            async def aread(self):
+                return body.encode()
+
+        class FakeStream:
+            async def __aenter__(self):
+                return FakeResponse()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class FakeClient:
+            def stream(self, *_args, **_kwargs):
+                return FakeStream()
+
+        async def consume():
+            async for _ in gb._stream_route(
+                quota.Route("groq", "openai/gpt-oss-20b", 0),
+                [], 100, 0.2, "hello", False, None,
+            ):
+                pass
+
+        output = io.StringIO()
+        with redirect_stdout(output), \
+             mock.patch.object(gb, "_client", return_value=FakeClient()), \
+             mock.patch.object(gb.quota, "note_response"):
+            with self.assertRaises(gb.RouteError):
+                asyncio.run(consume())
+
+        logged = output.getvalue()
+        self.assertIn("Chat completion HTTP 400", logged)
+        self.assertIn("invalid field", logged)
+        self.assertNotIn("gsk_fake-secret", logged)
+
+    def test_groq_stt_http_error_logs_status_without_response_body(self):
+        class FakeResponse:
+            status_code = 403
+            text = 'Authorization: Bearer fake-token; private response content'
+
+        class FakeClient:
+            async def post(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        output = io.StringIO()
+        with redirect_stdout(output), \
+             mock.patch.object(gb, "_api_key", "dummy-key"), \
+             mock.patch.object(gb, "_client", return_value=FakeClient()):
+            result = asyncio.run(gb.transcribe_audio(b"fake-audio"))
+
+        logged = output.getvalue()
+        self.assertIsNone(result)
+        self.assertIn("HTTP 403", logged)
+        self.assertNotIn("fake-token", logged)
+        self.assertNotIn("private response content", logged)
+
+    def test_groq_stt_exception_logs_type_without_exception_message(self):
+        class FakeClient:
+            async def post(self, *_args, **_kwargs):
+                raise RuntimeError("Bearer fake-token; private response content")
+
+        output = io.StringIO()
+        with redirect_stdout(output), \
+             mock.patch.object(gb, "_api_key", "dummy-key"), \
+             mock.patch.object(gb, "_client", return_value=FakeClient()):
+            result = asyncio.run(gb.transcribe_audio(b"fake-audio"))
+
+        logged = output.getvalue()
+        self.assertIsNone(result)
+        self.assertIn("RuntimeError", logged)
+        self.assertNotIn("fake-token", logged)
+        self.assertNotIn("private response content", logged)
 
 
 class LadderIntegrationTests(unittest.TestCase):
